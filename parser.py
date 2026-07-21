@@ -8,9 +8,12 @@ and generator can migrate each call into AgentQL.
 
 from __future__ import annotations
 
+import argparse
 import ast
+import json
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Sequence
@@ -278,3 +281,73 @@ def summarize(locators: Sequence[ParsedLocator]) -> dict[str, int]:
         key = locator.interaction.value
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def locators_as_dicts(locators: Sequence[ParsedLocator]) -> list[dict[str, object]]:
+    """Serialize locators for JSON / downstream tooling."""
+    rows: list[dict[str, object]] = []
+    for locator in locators:
+        row = asdict(locator)
+        row["kind"] = locator.kind.value
+        row["interaction"] = locator.interaction.value
+        rows.append(row)
+    return rows
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Extract brittle Playwright/Selenium locators from a Python script.",
+    )
+    parser.add_argument(
+        "script",
+        nargs="?",
+        default="sample_legacy.py",
+        help="Legacy Python file to inspect (default: sample_legacy.py)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a human table",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint used by ``python parser.py`` and future migrator wiring."""
+    args = _build_arg_parser().parse_args(argv)
+    path = Path(args.script)
+    if not path.is_file():
+        print(f"error: file not found: {path}", file=sys.stderr)
+        return 1
+
+    locators = parse_file(path)
+    if args.json:
+        payload = {
+            "file": str(path),
+            "count": len(locators),
+            "summary": summarize(locators),
+            "locators": locators_as_dicts(locators),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"Parsed {len(locators)} locator(s) from {path}")
+    if not locators:
+        return 0
+
+    print(f"{'LINE':>5}  {'ACTION':<14}  {'KIND':<8}  SELECTOR")
+    print("-" * 72)
+    for locator in locators:
+        print(
+            f"{locator.lineno:>5}  "
+            f"{locator.interaction.value:<14}  "
+            f"{locator.kind.value:<8}  "
+            f"{locator.selector}"
+        )
+    print("-" * 72)
+    print("summary:", summarize(locators))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
