@@ -5,4 +5,12 @@ CSS/XPath locators into semantic AgentQL queries.
 
 ## Status
 
-Incremental build in progress. Start with `sample_legacy.py` as the E2E fixture.
+- Done: `sample_legacy.py` fixture, deps/env stubs, **`parser.py`** AST extractor
+- Next: `translator.py` (OpenAI gpt-4o-mini → snake_case AgentQL names + fallbacks)
+
+## Quick check
+
+```bash
+python parser.py sample_legacy.py
+python -m unittest test_parser.py
+```

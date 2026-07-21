@@ -2,6 +2,7 @@
 Dummy legacy Playwright script with brittle CSS/XPath locators.
 
 Used as the end-to-end fixture for the Legacy-to-AgentQL Migrator.
+The AST parser (`parser.py`) should discover four locator call sites below.
 """
 
 from playwright.sync_api import sync_playwright
