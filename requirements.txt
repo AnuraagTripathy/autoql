@@ -1,0 +1,5 @@
+openai
+agentql
+rich
+python-dotenv
+playwright
