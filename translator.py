@@ -9,6 +9,8 @@ heuristic fallbacks so offline / CI runs still produce usable names.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +19,29 @@ from typing import Sequence
 from parser import Interaction, ParsedLocator
 
 DEFAULT_MODEL = "gpt-4o-mini"
+
+# Source weights: semantic attributes beat structural classes/tags.
+_SOURCE_WEIGHTS: dict[str, int] = {
+    "testid": 8,
+    "name": 7,
+    "aria": 6,
+    "placeholder": 5,
+    "type": 5,
+    "id": 4,
+    "class": 2,
+    "tag": 0,
+}
+
+_SYSTEM_PROMPT = """\
+You name DOM elements for AgentQL queries.
+Given a brittle CSS or XPath selector and the interaction applied to it,
+reply with JSON only: {"name": "<snake_case>", "rationale": "<short reason>"}.
+Rules:
+- name must be snake_case, start with a letter, and describe the element's role
+- prefer roles like username_input, password_input, submit_button, show_password_button
+- do not include CSS/XPath syntax in the name
+- keep names short (2-4 words / tokens)
+"""
 
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -146,33 +171,33 @@ def ensure_unique(name: str, used: set[str]) -> str:
     return unique
 
 
-def _tokens_from_selector(selector: str) -> list[str]:
-    """Pull the most meaningful identifier-like tokens from a selector."""
-    tokens: list[str] = []
+def _tokens_from_selector(selector: str) -> list[tuple[str, str]]:
+    """Pull ``(source, token)`` pairs from a selector, attrs first."""
+    tokens: list[tuple[str, str]] = []
 
-    for _label, pattern in _ATTR_PATTERNS:
+    for label, pattern in _ATTR_PATTERNS:
         for match in pattern.finditer(selector):
-            tokens.append(match.group(1))
+            tokens.append((label, match.group(1)))
 
     for match in _CLASS_PATTERN.finditer(selector):
-        tokens.append(match.group(1))
+        tokens.append(("class", match.group(1)))
     for match in _XPATH_CLASS.finditer(selector):
-        tokens.append(match.group(1))
+        tokens.append(("class", match.group(1)))
 
     # Structural tags are last-resort hints when nothing semantic appears.
     for match in _TAG_PATTERN.finditer(selector):
-        tokens.append(match.group(1))
+        tokens.append(("tag", match.group(1)))
 
     return tokens
 
 
-def _score_token(token: str) -> int:
-    """Higher scores prefer semantic tokens over layout chrome."""
+def _score_token(token: str, source: str) -> int:
+    """Higher scores prefer semantic attributes over layout chrome."""
     snake = to_snake_case(token)
     if not snake or snake in _NOISE_TOKENS:
         return -1
-    score = 1
-    if any(hint in snake for hint in ("user", "pass", "email", "login", "submit", "search")):
+    score = 1 + _SOURCE_WEIGHTS.get(source, 0)
+    if any(hint in snake for hint in ("user", "pass", "email", "login", "submit", "search", "pwd")):
         score += 3
     if snake.endswith(("btn", "button", "input", "field", "link")):
         score += 1
@@ -184,14 +209,15 @@ def _score_token(token: str) -> int:
 def _pick_stem(locator: ParsedLocator) -> str:
     """Choose a base identifier stem from selector hints."""
     ranked: list[tuple[int, str]] = []
-    for token in _tokens_from_selector(locator.selector):
-        score = _score_token(token)
+    for source, token in _tokens_from_selector(locator.selector):
+        score = _score_token(token, source)
         if score < 0:
             continue
         ranked.append((score, to_snake_case(token)))
 
     if ranked:
-        ranked.sort(key=lambda item: (-item[0], -len(item[1]), item[1]))
+        # Prefer higher score, then shorter stems (user over login_form).
+        ranked.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
         return ranked[0][1]
 
     # Interaction-only fallback when the selector is pure structure.
@@ -220,6 +246,77 @@ def heuristic_name(locator: ParsedLocator) -> str:
     return f"{stem}_{suffix}"
 
 
+def resolve_api_key(api_key: str | None = None) -> str | None:
+    """Return an explicit key, else ``OPENAI_API_KEY`` from the environment."""
+    if api_key:
+        return api_key
+    return os.environ.get("OPENAI_API_KEY") or None
+
+
+def _fallback_translation(
+    locator: ParsedLocator,
+    used: set[str],
+    *,
+    rationale: str,
+) -> TranslatedLocator:
+    """Build a :class:`TranslatedLocator` from the local heuristic."""
+    name = ensure_unique(heuristic_name(locator), used)
+    return TranslatedLocator(
+        locator=locator,
+        name=name,
+        source=TranslationSource.FALLBACK,
+        rationale=rationale,
+    )
+
+
+def _openai_name_for(
+    locator: ParsedLocator,
+    *,
+    api_key: str,
+    model: str,
+) -> tuple[str, str] | None:
+    """Ask OpenAI for a name; return ``(name, rationale)`` or ``None``."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
+
+    user_prompt = {
+        "selector": locator.selector,
+        "kind": locator.kind.value,
+        "interaction": locator.interaction.value,
+        "fill_value": locator.fill_value,
+        "raw_call": locator.raw_call,
+    }
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(user_prompt)},
+            ],
+        )
+    except Exception:
+        return None
+
+    try:
+        content = response.choices[0].message.content or ""
+        payload = json.loads(content)
+    except (IndexError, TypeError, json.JSONDecodeError, AttributeError):
+        return None
+
+    name = payload.get("name") if isinstance(payload, dict) else None
+    rationale = payload.get("rationale") if isinstance(payload, dict) else None
+    if not isinstance(name, str) or not is_valid_agentql_name(to_snake_case(name)):
+        return None
+    reason = rationale if isinstance(rationale, str) else "openai suggestion"
+    return to_snake_case(name), reason
+
+
 def translate_locator(
     locator: ParsedLocator,
     *,
@@ -228,8 +325,33 @@ def translate_locator(
     model: str = DEFAULT_MODEL,
     force_fallback: bool = False,
 ) -> TranslatedLocator:
-    """Translate one locator into an AgentQL field name (stub)."""
-    raise NotImplementedError("OpenAI translator not yet implemented")
+    """Translate one locator into a unique AgentQL field name.
+
+    Tries gpt-4o-mini when an API key is available and *force_fallback* is
+    false. Any missing key, import/network/parse failure, or invalid name
+    falls back to :func:`heuristic_name`.
+    """
+    used = used_names if used_names is not None else set()
+    key = resolve_api_key(api_key)
+
+    if not force_fallback and key:
+        suggestion = _openai_name_for(locator, api_key=key, model=model)
+        if suggestion is not None:
+            name, rationale = suggestion
+            return TranslatedLocator(
+                locator=locator,
+                name=ensure_unique(name, used),
+                source=TranslationSource.OPENAI,
+                rationale=rationale,
+            )
+        return _fallback_translation(
+            locator,
+            used,
+            rationale="openai unavailable or invalid; used heuristic",
+        )
+
+    reason = "force_fallback" if force_fallback else "no OPENAI_API_KEY; used heuristic"
+    return _fallback_translation(locator, used, rationale=reason)
 
 
 def translate_locators(
