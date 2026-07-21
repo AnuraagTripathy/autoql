@@ -54,11 +54,19 @@ _LOCATOR_BUILDERS = frozenset({"locator", "query_selector", "query_selector_all"
 _FIND_ELEMENT_METHODS = frozenset({"find_element", "find_elements"})
 
 _XPATH_PREFIX = re.compile(r"^\s*(//|\(\s*\.?/|\./)")
-
-
 @dataclass(frozen=True, slots=True)
 class ParsedLocator:
-    """One locator occurrence discovered in a legacy script."""
+    """One locator occurrence discovered in a legacy script.
+
+    Attributes:
+        selector: Raw CSS/XPath string from the call site.
+        kind: Heuristic classification of *selector*.
+        interaction: Action chained or applied to the locator.
+        lineno: 1-based line of the locator builder / call.
+        col_offset: 0-based column of that node.
+        fill_value: Literal value for fill/type when available.
+        raw_call: Original method name (e.g. ``fill``, ``find_element``).
+    """
 
     selector: str
     kind: LocatorKind
@@ -73,34 +81,56 @@ def classify_selector(selector: str) -> LocatorKind:
     """Best-effort CSS vs XPath classification for a selector string."""
     if not selector or not selector.strip():
         return LocatorKind.UNKNOWN
-    if selector.lstrip().startswith(("xpath=", "xpath=")) or _XPATH_PREFIX.match(selector):
+
+    stripped = selector.lstrip()
+    if stripped.startswith("xpath=") or _XPATH_PREFIX.match(selector):
         return LocatorKind.XPATH
-    if selector.startswith("/") and not selector.startswith("//"):
-        # Bare absolute path is uncommon for CSS; treat as XPath-ish.
+    # Bare absolute path is uncommon for CSS; treat as XPath-ish.
+    if stripped.startswith("/") and not stripped.startswith("//"):
         return LocatorKind.XPATH
     return LocatorKind.CSS
 
 
 def _literal_str(node: ast.AST | None) -> str | None:
+    """Return the string value of a constant node, else ``None``."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
 
 
-def _attr_chain(node: ast.AST) -> list[str]:
-    """Return dotted attribute names from the outside in, e.g. page.locator -> [locator, page]."""
-    names: list[str] = []
-    current: ast.AST | None = node
-    while isinstance(current, ast.Attribute):
-        names.append(current.attr)
-        current = current.value
-    if isinstance(current, ast.Name):
-        names.append(current.id)
-    return names
+def _append_locator(
+    bucket: list[ParsedLocator],
+    *,
+    selector: str,
+    kind: LocatorKind,
+    interaction: Interaction,
+    lineno: int,
+    col_offset: int,
+    fill_value: str | None,
+    raw_call: str,
+) -> None:
+    """Construct and store a :class:`ParsedLocator`."""
+    bucket.append(
+        ParsedLocator(
+            selector=selector,
+            kind=kind,
+            interaction=interaction,
+            lineno=lineno,
+            col_offset=col_offset,
+            fill_value=fill_value,
+            raw_call=raw_call,
+        )
+    )
 
 
 class LocatorVisitor(ast.NodeVisitor):
-    """Collect Playwright/Selenium locator usages from an AST."""
+    """Collect Playwright/Selenium locator usages from an AST.
+
+    Supported shapes:
+      * ``page.locator(sel).click()`` / ``.fill(value)`` (and siblings)
+      * ``page.click(sel)`` / ``page.fill(sel, value)``
+      * ``driver.find_element(By.CSS_SELECTOR, sel)``
+    """
 
     def __init__(self) -> None:
         self.locators: list[ParsedLocator] = []
@@ -112,10 +142,11 @@ class LocatorVisitor(ast.NodeVisitor):
             or self._try_find_element(node)
         )
         if not handled:
+            # Descend so nested calls inside arguments are still inspected.
             self.generic_visit(node)
 
     def _try_chained_locator(self, node: ast.Call) -> bool:
-        """Match page.locator(...).click()/fill() style chains."""
+        """Match ``page.locator(...).click()`` / ``.fill()`` style chains."""
         if not isinstance(node.func, ast.Attribute):
             return False
         action_name = node.func.attr
@@ -125,108 +156,108 @@ class LocatorVisitor(ast.NodeVisitor):
         receiver = node.func.value
         if not isinstance(receiver, ast.Call) or not isinstance(receiver.func, ast.Attribute):
             return False
-        if receiver.func.attr not in _LOCATOR_BUILDERS:
-            return False
-        if not receiver.args:
+        if receiver.func.attr not in _LOCATOR_BUILDERS or not receiver.args:
             return False
 
         selector = _literal_str(receiver.args[0])
         if selector is None:
             return False
 
-        fill_value = None
         interaction = _INTERACTION_MAP[action_name]
+        fill_value: str | None = None
         if interaction in {Interaction.FILL, Interaction.TYPE} and node.args:
             fill_value = _literal_str(node.args[0])
 
-        self.locators.append(
-            ParsedLocator(
-                selector=selector,
-                kind=classify_selector(selector),
-                interaction=interaction,
-                lineno=receiver.lineno,
-                col_offset=receiver.col_offset,
-                fill_value=fill_value,
-                raw_call=action_name,
-            )
+        _append_locator(
+            self.locators,
+            selector=selector,
+            kind=classify_selector(selector),
+            interaction=interaction,
+            lineno=receiver.lineno,
+            col_offset=receiver.col_offset,
+            fill_value=fill_value,
+            raw_call=action_name,
         )
         return True
 
     def _try_page_direct_action(self, node: ast.Call) -> bool:
-        """Match page.click(selector) / page.fill(selector, value)."""
+        """Match ``page.click(selector)`` / ``page.fill(selector, value)``."""
         if not isinstance(node.func, ast.Attribute):
             return False
         action_name = node.func.attr
         if action_name not in _PAGE_DIRECT_ACTIONS:
             return False
-        # Skip if this is already a chained locator().action()
-        if isinstance(node.func.value, ast.Call):
-            return False
-        if not node.args:
+        # Skip chained locator().action() — handled above.
+        if isinstance(node.func.value, ast.Call) or not node.args:
             return False
 
         selector = _literal_str(node.args[0])
         if selector is None:
             return False
 
-        fill_value = None
         interaction = _INTERACTION_MAP[action_name]
+        fill_value: str | None = None
         if interaction in {Interaction.FILL, Interaction.TYPE} and len(node.args) >= 2:
             fill_value = _literal_str(node.args[1])
 
-        self.locators.append(
-            ParsedLocator(
-                selector=selector,
-                kind=classify_selector(selector),
-                interaction=interaction,
-                lineno=node.lineno,
-                col_offset=node.col_offset,
-                fill_value=fill_value,
-                raw_call=action_name,
-            )
+        _append_locator(
+            self.locators,
+            selector=selector,
+            kind=classify_selector(selector),
+            interaction=interaction,
+            lineno=node.lineno,
+            col_offset=node.col_offset,
+            fill_value=fill_value,
+            raw_call=action_name,
         )
         return True
 
     def _try_find_element(self, node: ast.Call) -> bool:
-        """Match driver.find_element(By.CSS_SELECTOR, '...') patterns."""
+        """Match ``driver.find_element(By.CSS_SELECTOR, '...')`` patterns."""
         if not isinstance(node.func, ast.Attribute):
             return False
-        if node.func.attr not in _FIND_ELEMENT_METHODS:
-            return False
-        if len(node.args) < 2:
+        if node.func.attr not in _FIND_ELEMENT_METHODS or len(node.args) < 2:
             return False
 
         selector = _literal_str(node.args[1])
         if selector is None:
             return False
 
-        kind = LocatorKind.UNKNOWN
-        strategy = node.args[0]
-        if isinstance(strategy, ast.Attribute):
-            strategy_name = strategy.attr.upper()
-            if "XPATH" in strategy_name:
-                kind = LocatorKind.XPATH
-            elif any(token in strategy_name for token in ("CSS", "ID", "NAME", "CLASS", "TAG")):
-                kind = LocatorKind.CSS
-        if kind is LocatorKind.UNKNOWN:
-            kind = classify_selector(selector)
-
-        self.locators.append(
-            ParsedLocator(
-                selector=selector,
-                kind=kind,
-                interaction=Interaction.NONE,
-                lineno=node.lineno,
-                col_offset=node.col_offset,
-                fill_value=None,
-                raw_call=node.func.attr,
-            )
+        kind = self._kind_from_by_strategy(node.args[0], selector)
+        _append_locator(
+            self.locators,
+            selector=selector,
+            kind=kind,
+            interaction=Interaction.NONE,
+            lineno=node.lineno,
+            col_offset=node.col_offset,
+            fill_value=None,
+            raw_call=node.func.attr,
         )
         return True
 
+    @staticmethod
+    def _kind_from_by_strategy(strategy: ast.AST, selector: str) -> LocatorKind:
+        """Map a Selenium ``By.*`` argument to :class:`LocatorKind`."""
+        if isinstance(strategy, ast.Attribute):
+            strategy_name = strategy.attr.upper()
+            if "XPATH" in strategy_name:
+                return LocatorKind.XPATH
+            if any(token in strategy_name for token in ("CSS", "ID", "NAME", "CLASS", "TAG")):
+                return LocatorKind.CSS
+        return classify_selector(selector)
+
 
 def parse_source(source: str, *, filename: str = "<string>") -> list[ParsedLocator]:
-    """Parse *source* and return every locator the visitor recognizes."""
+    """Parse *source* and return every locator the visitor recognizes.
+
+    Args:
+        source: Python source text containing Playwright/Selenium calls.
+        filename: Name attached to AST nodes for error context.
+
+    Returns:
+        Locators in source order (stable for deterministic migration).
+    """
     tree = ast.parse(source, filename=filename)
     visitor = LocatorVisitor()
     visitor.visit(tree)
