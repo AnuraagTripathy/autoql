@@ -22,6 +22,69 @@ _SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 
+# Prefer semantic HTML / test-id hints over structural noise.
+_ATTR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("testid", re.compile(r"""data-testid\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("testid", re.compile(r"""@data-testid\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("name", re.compile(r"""\[name\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("name", re.compile(r"""@name\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("id", re.compile(r"""#([A-Za-z][\w-]*)""")),
+    ("id", re.compile(r"""\[id\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("id", re.compile(r"""@id\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("aria", re.compile(r"""aria-label\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("placeholder", re.compile(r"""placeholder\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("type", re.compile(r"""\[type\s*=\s*['"]([^'"]+)['"]""", re.I)),
+    ("type", re.compile(r"""@type\s*=\s*['"]([^'"]+)['"]""", re.I)),
+)
+
+_CLASS_PATTERN = re.compile(r"""\.([A-Za-z][\w-]*)""")
+_XPATH_CLASS = re.compile(
+    r"""contains\(\s*@class\s*,\s*['"]([^'"]+)['"]\s*\)""",
+    re.I,
+)
+_TAG_PATTERN = re.compile(r"(?:^|[/\s>+~,])([a-z][a-z0-9]*)", re.I)
+
+_NOISE_TOKENS = frozenset(
+    {
+        "div",
+        "span",
+        "ul",
+        "li",
+        "form",
+        "body",
+        "html",
+        "app",
+        "container",
+        "wrapper",
+        "main",
+        "section",
+        "nth",
+        "child",
+        "contains",
+        "class",
+        "btn",
+        "button",  # re-added via interaction suffix when useful
+        "input",
+        "icon",
+        "toolbar",
+        "footer",
+        "header",
+        "nav",
+    }
+)
+
+_INTERACTION_SUFFIX: dict[Interaction, str] = {
+    Interaction.CLICK: "button",
+    Interaction.FILL: "input",
+    Interaction.TYPE: "input",
+    Interaction.CHECK: "checkbox",
+    Interaction.SELECT: "select",
+    Interaction.HOVER: "element",
+    Interaction.WAIT: "element",
+    Interaction.OTHER: "element",
+    Interaction.NONE: "element",
+}
+
 
 class TranslationSource(str, Enum):
     """Where the AgentQL field name came from."""
@@ -83,9 +146,78 @@ def ensure_unique(name: str, used: set[str]) -> str:
     return unique
 
 
+def _tokens_from_selector(selector: str) -> list[str]:
+    """Pull the most meaningful identifier-like tokens from a selector."""
+    tokens: list[str] = []
+
+    for _label, pattern in _ATTR_PATTERNS:
+        for match in pattern.finditer(selector):
+            tokens.append(match.group(1))
+
+    for match in _CLASS_PATTERN.finditer(selector):
+        tokens.append(match.group(1))
+    for match in _XPATH_CLASS.finditer(selector):
+        tokens.append(match.group(1))
+
+    # Structural tags are last-resort hints when nothing semantic appears.
+    for match in _TAG_PATTERN.finditer(selector):
+        tokens.append(match.group(1))
+
+    return tokens
+
+
+def _score_token(token: str) -> int:
+    """Higher scores prefer semantic tokens over layout chrome."""
+    snake = to_snake_case(token)
+    if not snake or snake in _NOISE_TOKENS:
+        return -1
+    score = 1
+    if any(hint in snake for hint in ("user", "pass", "email", "login", "submit", "search")):
+        score += 3
+    if snake.endswith(("btn", "button", "input", "field", "link")):
+        score += 1
+    if len(snake) <= 2:
+        score -= 1
+    return score
+
+
+def _pick_stem(locator: ParsedLocator) -> str:
+    """Choose a base identifier stem from selector hints."""
+    ranked: list[tuple[int, str]] = []
+    for token in _tokens_from_selector(locator.selector):
+        score = _score_token(token)
+        if score < 0:
+            continue
+        ranked.append((score, to_snake_case(token)))
+
+    if ranked:
+        ranked.sort(key=lambda item: (-item[0], -len(item[1]), item[1]))
+        return ranked[0][1]
+
+    # Interaction-only fallback when the selector is pure structure.
+    return _INTERACTION_SUFFIX.get(locator.interaction, "element")
+
+
 def heuristic_name(locator: ParsedLocator) -> str:
-    """Derive a snake_case AgentQL name from selector tokens (stub)."""
-    raise NotImplementedError("heuristic fallback not yet implemented")
+    """Derive a snake_case AgentQL name from selector tokens and interaction.
+
+    Prefers ``name`` / ``data-testid`` / id / type attributes, then useful
+    class fragments, and finally tags. Appends an interaction-appropriate
+    suffix when it is not already implied by the stem.
+    """
+    stem = _pick_stem(locator)
+    suffix = _INTERACTION_SUFFIX.get(locator.interaction, "element")
+
+    # Avoid ``password_input_input`` / ``submit_button_button`` duplication.
+    if stem == suffix or stem.endswith(f"_{suffix}"):
+        return stem
+    if suffix == "button" and stem.endswith(("_btn", "btn", "_button", "button")):
+        return stem if stem.endswith("button") else to_snake_case(stem.replace("btn", "button"))
+    if suffix == "input" and any(stem.endswith(s) for s in ("_input", "_field", "input", "field")):
+        return stem
+
+    # Type=password + fill → password_input; name=user + fill → user_input.
+    return f"{stem}_{suffix}"
 
 
 def translate_locator(
