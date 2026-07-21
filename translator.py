@@ -9,14 +9,17 @@ heuristic fallbacks so offline / CI runs still produce usable names.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Sequence
 
-from parser import Interaction, ParsedLocator
+from parser import Interaction, ParsedLocator, parse_file
 
 DEFAULT_MODEL = "gpt-4o-mini"
 
@@ -136,7 +139,11 @@ class TranslatedLocator:
 
 
 def to_snake_case(raw: str) -> str:
-    """Normalize *raw* into a conservative snake_case identifier."""
+    """Normalize *raw* into a conservative snake_case identifier.
+
+    Empty / punctuation-only inputs become ``\"element\"``. Leading digits
+    are prefixed with ``el_`` so the result stays a valid AgentQL field.
+    """
     if not raw or not raw.strip():
         return "element"
 
@@ -361,7 +368,14 @@ def translate_locators(
     model: str = DEFAULT_MODEL,
     force_fallback: bool = False,
 ) -> list[TranslatedLocator]:
-    """Translate locators in order, keeping names unique across the batch."""
+    """Translate *locators* in order, keeping names unique across the batch.
+
+    Args:
+        locators: Parser output to rename.
+        api_key: Optional OpenAI key; defaults to ``OPENAI_API_KEY``.
+        model: Chat model id (default: ``gpt-4o-mini``).
+        force_fallback: Skip the API and use heuristics only.
+    """
     used: set[str] = set()
     results: list[TranslatedLocator] = []
     for locator in locators:
@@ -375,3 +389,115 @@ def translate_locators(
             )
         )
     return results
+
+
+def translations_as_dicts(
+    translations: Sequence[TranslatedLocator],
+) -> list[dict[str, object]]:
+    """Serialize translations for JSON / downstream generator wiring."""
+    rows: list[dict[str, object]] = []
+    for item in translations:
+        locator_row = asdict(item.locator)
+        locator_row["kind"] = item.locator.kind.value
+        locator_row["interaction"] = item.locator.interaction.value
+        rows.append(
+            {
+                "name": item.name,
+                "source": item.source.value,
+                "rationale": item.rationale,
+                "locator": locator_row,
+            }
+        )
+    return rows
+
+
+def _load_dotenv_if_present() -> None:
+    """Best-effort ``.env`` load so local keys work without exporting."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Translate brittle Playwright/Selenium locators into snake_case "
+            "AgentQL field names (OpenAI gpt-4o-mini with heuristic fallback)."
+        ),
+    )
+    parser.add_argument(
+        "script",
+        nargs="?",
+        default="sample_legacy.py",
+        help="Legacy Python file to inspect (default: sample_legacy.py)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a human table",
+    )
+    parser.add_argument(
+        "--fallback",
+        action="store_true",
+        help="Skip OpenAI and use heuristic names only",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"OpenAI chat model (default: {DEFAULT_MODEL})",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint: parse a script, then translate its locators."""
+    args = _build_arg_parser().parse_args(argv)
+    path = Path(args.script)
+    if not path.is_file():
+        print(f"error: file not found: {path}", file=sys.stderr)
+        return 1
+
+    _load_dotenv_if_present()
+    locators = parse_file(path)
+    translations = translate_locators(
+        locators,
+        model=args.model,
+        force_fallback=args.fallback,
+    )
+
+    if args.json:
+        payload = {
+            "file": str(path),
+            "count": len(translations),
+            "model": args.model,
+            "force_fallback": args.fallback,
+            "translations": translations_as_dicts(translations),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"Translated {len(translations)} locator(s) from {path}")
+    if not translations:
+        return 0
+
+    print(f"{'LINE':>5}  {'SOURCE':<8}  {'NAME':<22}  SELECTOR")
+    print("-" * 78)
+    for item in translations:
+        print(
+            f"{item.locator.lineno:>5}  "
+            f"{item.source.value:<8}  "
+            f"{item.name:<22}  "
+            f"{item.locator.selector}"
+        )
+    print("-" * 78)
+    sources = {}
+    for item in translations:
+        sources[item.source.value] = sources.get(item.source.value, 0) + 1
+    print("sources:", sources)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
