@@ -8,7 +8,6 @@ calls ``query_elements``, and replays the original interactions.
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -134,6 +133,92 @@ def action_statement(action: GeneratedAction, *, response_var: str = "elements")
     return f"{target}.{method}()"
 
 
+def field_names(translations: Sequence[TranslatedLocator]) -> tuple[str, ...]:
+    """Return ordered unique valid AgentQL field names from *translations*."""
+    query = build_agentql_query(translations)
+    names = [
+        line.strip()
+        for line in query.splitlines()
+        if line.strip() and line.strip() not in {"{", "}"}
+    ]
+    return tuple(names)
+
+
+def translations_to_actions(
+    translations: Sequence[TranslatedLocator],
+) -> tuple[GeneratedAction, ...]:
+    """Project translations into ordered :class:`GeneratedAction` steps."""
+    actions: list[GeneratedAction] = []
+    for item in translations:
+        if not is_valid_agentql_name(item.name):
+            continue
+        actions.append(
+            GeneratedAction(
+                name=item.name,
+                interaction=item.locator.interaction,
+                fill_value=item.locator.fill_value,
+                source_lineno=item.locator.lineno,
+            )
+        )
+    return tuple(actions)
+
+
+def _render_python_module(
+    *,
+    query: str,
+    actions: Sequence[GeneratedAction],
+    url: str,
+    function_name: str,
+    headless: bool,
+    source_path: str | None,
+) -> str:
+    """Assemble a complete sync_playwright + AgentQL Python module."""
+    origin = source_path or "legacy script"
+    url_lit = _python_string_literal(url)
+    headless_lit = "True" if headless else "False"
+    # Keep QUERY as a triple-quoted string with the AgentQL block indented.
+    query_literal = '"""\n' + query + '\n"""'
+
+    action_lines = [
+        f"        {action_statement(action)}" for action in actions
+    ]
+    if action_lines:
+        actions_block = "\n".join(action_lines)
+    else:
+        actions_block = "        pass  # no interactions discovered"
+
+    return f'''\
+"""
+Auto-generated AgentQL migration of {origin}.
+
+Regenerate with ``python generator.py`` — do not hand-edit locators here.
+Requires AGENTQL_API_KEY (see .env.example).
+"""
+
+import agentql
+from playwright.sync_api import sync_playwright
+
+QUERY = {query_literal}
+
+
+def {function_name}() -> None:
+    """Run the migrated flow with semantic AgentQL selectors."""
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless={headless_lit})
+        page = agentql.wrap(browser.new_page())
+        page.goto({url_lit})
+
+        elements = page.query_elements(QUERY)
+{actions_block}
+
+        browser.close()
+
+
+if __name__ == "__main__":
+    {function_name}()
+'''
+
+
 def generate_script(
     translations: Sequence[TranslatedLocator],
     *,
@@ -142,5 +227,31 @@ def generate_script(
     headless: bool = True,
     source_path: str | None = None,
 ) -> GeneratedScript:
-    """Emit an AgentQL + sync_playwright script (stub)."""
-    raise NotImplementedError("script generator not yet implemented")
+    """Emit an AgentQL query plus a runnable sync_playwright script.
+
+    Args:
+        translations: Named locators from ``translator.translate_locators``.
+        url: Target for ``page.goto`` (caller may override or detect).
+        function_name: Entrypoint def name in the generated module.
+        headless: Whether Chromium launches headless.
+        source_path: Optional legacy path recorded in the module docstring.
+    """
+    query = build_agentql_query(translations)
+    names = field_names(translations)
+    actions = translations_to_actions(translations)
+    python_source = _render_python_module(
+        query=query,
+        actions=actions,
+        url=url,
+        function_name=function_name,
+        headless=headless,
+        source_path=source_path,
+    )
+    return GeneratedScript(
+        query=query,
+        python_source=python_source,
+        url=url,
+        field_names=names,
+        actions=actions,
+        source_path=source_path,
+    )
