@@ -8,14 +8,33 @@ calls ``query_elements``, and replays the original interactions.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from typing import Sequence
 
 from parser import Interaction
-from translator import TranslatedLocator
+from translator import TranslatedLocator, is_valid_agentql_name
 
 DEFAULT_URL = "https://example.com"
 DEFAULT_FUNCTION_NAME = "run_migrated_flow"
+
+_INTERACTION_METHODS: dict[Interaction, str] = {
+    Interaction.CLICK: "click",
+    Interaction.FILL: "fill",
+    Interaction.TYPE: "type",
+    Interaction.CHECK: "check",
+    Interaction.SELECT: "select_option",
+    Interaction.HOVER: "hover",
+    Interaction.WAIT: "wait_for",
+}
+
+_VALUE_INTERACTIONS = frozenset(
+    {
+        Interaction.FILL,
+        Interaction.TYPE,
+        Interaction.SELECT,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,14 +75,63 @@ class GeneratedScript:
     source_path: str | None = None
 
 
+def _python_string_literal(value: str) -> str:
+    """Render *value* as a safely escaped Python string literal."""
+    return repr(value)
+
+
 def build_agentql_query(translations: Sequence[TranslatedLocator]) -> str:
-    """Build an AgentQL query block from translated field names (stub)."""
-    raise NotImplementedError("AgentQL query builder not yet implemented")
+    """Build an AgentQL query block from translated field names.
+
+    Emits a multi-line query such as::
+
+        {
+            user_input
+            submit_button
+        }
+
+    Duplicate names are kept once (first occurrence wins) so the query
+    stays valid even if uniqueness slipped upstream.
+    """
+    seen: set[str] = set()
+    fields: list[str] = []
+    for item in translations:
+        name = item.name.strip()
+        if not name or name in seen:
+            continue
+        if not is_valid_agentql_name(name):
+            continue
+        seen.add(name)
+        fields.append(name)
+
+    if not fields:
+        return "{\n}"
+
+    body = "\n".join(f"    {name}" for name in fields)
+    return "{\n" + body + "\n}"
 
 
 def action_statement(action: GeneratedAction, *, response_var: str = "elements") -> str:
-    """Return one Python statement for *action* (stub)."""
-    raise NotImplementedError("action statement emitter not yet implemented")
+    """Return one Python statement that performs *action* on *response_var*.
+
+    Value-bearing interactions (fill / type / select_option) include a
+    safely quoted literal. Unsupported / none interactions become a
+    comment so generation never invents a bogus Playwright call.
+    """
+    method = _INTERACTION_METHODS.get(action.interaction)
+    target = f"{response_var}.{action.name}"
+
+    if method is None:
+        return (
+            f"# skip {action.name}: unsupported interaction "
+            f"{action.interaction.value!r}"
+        )
+
+    if action.interaction in _VALUE_INTERACTIONS:
+        literal = _python_string_literal(action.fill_value or "")
+        return f"{target}.{method}({literal})"
+
+    return f"{target}.{method}()"
 
 
 def generate_script(
