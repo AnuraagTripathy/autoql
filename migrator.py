@@ -7,6 +7,9 @@ with progress spinners, a locator summary table, and a success panel.
 
 from __future__ import annotations
 
+import argparse
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -213,9 +216,115 @@ def run_migration_with_status(
         )
 
 
+def _load_dotenv_if_present() -> None:
+    """Best-effort ``.env`` load so local OpenAI keys work without exporting."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Migrate a brittle Playwright/Selenium script to AgentQL via "
+            "parse → translate → generate, with a Rich progress UI."
+        ),
+    )
+    parser.add_argument(
+        "script",
+        nargs="?",
+        default="sample_legacy.py",
+        help="Legacy Python file to migrate (default: sample_legacy.py)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Write generated Python here (default: <stem>_agentql.py)",
+    )
+    parser.add_argument(
+        "--url",
+        help="Override page.goto URL (default: first literal goto, else example.com)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the Rich UI",
+    )
+    parser.add_argument(
+        "--fallback",
+        action="store_true",
+        help="Skip OpenAI naming and use heuristic translator names only",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Generate Chromium launch with headless=False",
+    )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print generated Python to stdout and skip writing a file",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"OpenAI chat model (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--function-name",
+        default=DEFAULT_FUNCTION_NAME,
+        help=f"Generated entrypoint name (default: {DEFAULT_FUNCTION_NAME})",
+    )
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint (wired after Rich helpers land)."""
-    raise NotImplementedError("Rich CLI wiring lands in a later commit")
+    """CLI entrypoint: Rich-orchestrated parse → translate → generate."""
+    args = _build_arg_parser().parse_args(argv)
+    path = Path(args.script)
+    console = Console(stderr=True)
+
+    if not path.is_file():
+        console.print(f"[red]error:[/red] file not found: {path}")
+        return 1
+
+    _load_dotenv_if_present()
+    if args.stdout:
+        write = False
+    elif args.json:
+        write = args.output is not None
+    else:
+        write = True
+
+    result = run_migration_with_status(
+        console,
+        path,
+        output=args.output,
+        url=args.url,
+        function_name=args.function_name,
+        headless=not args.headed,
+        force_fallback=args.fallback,
+        model=args.model,
+        write=write,
+    )
+
+    if args.json:
+        print(json.dumps(migration_as_dict(result), indent=2))
+        return 0
+
+    if args.stdout:
+        # Generated module on stdout; Rich chrome stays on stderr.
+        sys.stdout.write(result.script.python_source)
+        if not result.script.python_source.endswith("\n"):
+            sys.stdout.write("\n")
+
+    console.print()
+    console.print(build_translation_table(result))
+    console.print()
+    console.print(build_success_panel(result))
+    return 0
 
 
 if __name__ == "__main__":
