@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
 from generator import (
     DEFAULT_FUNCTION_NAME,
     GeneratedScript,
@@ -126,6 +131,86 @@ def migration_as_dict(result: MigrationResult) -> dict[str, object]:
         "translations": translations_as_dicts(result.translations),
         "script": script_as_dict(result.script),
     }
+
+
+def build_translation_table(result: MigrationResult) -> Table:
+    """Build a Rich table summarizing migrated locators and AgentQL names."""
+    table = Table(
+        title="Migrated locators",
+        show_header=True,
+        header_style="bold",
+        expand=True,
+    )
+    table.add_column("Line", justify="right", style="dim", width=5)
+    table.add_column("Action", style="cyan", min_width=8)
+    table.add_column("Source", style="magenta", min_width=8)
+    table.add_column("AgentQL name", style="green", min_width=16)
+    table.add_column("Selector", overflow="fold")
+
+    for item in result.translations:
+        table.add_row(
+            str(item.locator.lineno),
+            item.locator.interaction.value,
+            item.source.value,
+            item.name,
+            item.locator.selector,
+        )
+    return table
+
+
+def build_success_panel(result: MigrationResult) -> Panel:
+    """Build a Rich success panel summarizing the migration outcome."""
+    lines = [
+        f"Source:  {result.source_path}",
+        f"Fields:  {len(result.script.field_names)}",
+        f"Actions: {len(result.script.actions)}",
+        f"URL:     {result.script.url}",
+    ]
+    if result.output_path:
+        lines.append(f"Wrote:   {result.output_path}")
+    else:
+        lines.append("Wrote:   (stdout / not persisted)")
+
+    body = Text("\n".join(lines))
+    return Panel(
+        body,
+        title="[bold green]Migration complete[/bold green]",
+        border_style="green",
+        expand=False,
+    )
+
+
+def run_migration_with_status(
+    console: Console,
+    path: str | Path,
+    *,
+    output: str | Path | None = None,
+    url: str | None = None,
+    function_name: str = DEFAULT_FUNCTION_NAME,
+    headless: bool = True,
+    force_fallback: bool = False,
+    api_key: str | None = None,
+    model: str = DEFAULT_MODEL,
+    write: bool = True,
+) -> MigrationResult:
+    """Run :func:`migrate_file` under a Rich status spinner.
+
+    Parameters mirror :func:`migrate_file`; the console only drives the
+    spinner label while work runs.
+    """
+    label = f"Migrating {path}…"
+    with console.status(label, spinner="dots"):
+        return migrate_file(
+            path,
+            output=output,
+            url=url,
+            function_name=function_name,
+            headless=headless,
+            force_fallback=force_fallback,
+            api_key=api_key,
+            model=model,
+            write=write,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
