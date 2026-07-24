@@ -10,3 +10,6 @@ venv/
 
 # Local environment secrets
 .env
+
+# Default migrator outputs
+*_agentql.py
