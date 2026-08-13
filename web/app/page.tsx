@@ -117,6 +117,7 @@ export default function Page() {
               <textarea
                 className="code"
                 spellCheck={false}
+                rows={Math.max(lineCount(source), 8)}
                 value={source}
                 onChange={(event) => setSource(event.target.value)}
                 aria-label="Legacy Playwright or Selenium script"

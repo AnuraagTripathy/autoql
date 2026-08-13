@@ -169,6 +169,21 @@ textarea {
   backdrop-filter: blur(10px);
 }
 
+.workbench,
+.workbench *,
+.editor-wrap,
+textarea.code,
+pre.code {
+  scrollbar-width: none;
+}
+
+.workbench::-webkit-scrollbar,
+.workbench *::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
 .toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -254,10 +269,9 @@ textarea {
 
 .editor-wrap {
   display: grid;
-  grid-template-columns: 42px 1fr;
-  min-height: 420px;
-  max-height: 560px;
-  overflow: auto;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  overflow: hidden;
 }
 
 .gutter {
@@ -282,14 +296,17 @@ pre.code {
   border: 0;
   resize: none;
   width: 100%;
-  min-height: 420px;
+  min-height: 0;
+  height: auto;
   background: transparent;
   color: var(--ink);
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.55;
-  white-space: pre;
-  overflow: auto;
+  white-space: pre-wrap;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  field-sizing: content;
 }
 
 textarea.code:focus {
@@ -322,6 +339,7 @@ pre.code {
 
 .stats {
   display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   color: var(--muted);
   font-size: 12px;
@@ -340,11 +358,12 @@ pre.code {
   padding: 12px 14px;
   margin: 0 0 16px;
   color: var(--patina);
-  overflow: auto;
+  overflow: visible;
+  white-space: pre-wrap;
 }
 
 .table-wrap {
-  overflow: auto;
+  overflow: visible;
 }
 
 table {
