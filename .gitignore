@@ -13,3 +13,7 @@ venv/
 
 # Default migrator outputs
 *_agentql.py
+
+# Web demo
+web/node_modules/
+web/.next/

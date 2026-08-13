@@ -23,3 +23,18 @@ python -m unittest test_parser.py test_translator.py test_generator.py test_migr
 and success panel. Pass `--fallback` for offline heuristic names; set
 `OPENAI_API_KEY` (see `.env.example`) for gpt-4o-mini naming. Generated
 scripts need `AGENTQL_API_KEY` at runtime.
+
+## Website demo
+
+An interactive workbench lives in `web/`. It runs the same parse →
+translate → generate pipeline in the browser (heuristic names, matching
+`python migrator.py --fallback`).
+
+Live site: https://autoql-demo.vercel.app (preview may also deploy from
+this branch).
+
+```bash
+cd web
+npm install
+npm run dev
+```
