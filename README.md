@@ -30,6 +30,9 @@ An interactive workbench lives in `web/`. It runs the same parse →
 translate → generate pipeline in the browser (heuristic names, matching
 `python migrator.py --fallback`).
 
+Live site: https://autoql-demo.vercel.app (preview may also deploy from
+this branch).
+
 ```bash
 cd web
 npm install
